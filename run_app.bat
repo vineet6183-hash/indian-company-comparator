@@ -21,7 +21,8 @@ echo.
 REM ── Step 2: Install required packages ───────────────────────────────────────
 REM Using "python -m pip" is more reliable than calling "pip" directly on Windows.
 echo Installing / verifying dependencies...
-python -m pip install streamlit pandas openpyxl matplotlib --quiet
+python -m pip install streamlit pandas openpyxl matplotlib pdfplumber --quiet
+REM pdfplumber is needed for reading PDF files
 
 if %errorlevel% neq 0 (
     echo.
