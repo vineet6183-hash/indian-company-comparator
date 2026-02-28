@@ -4,7 +4,7 @@
 # side-by-side using key financial metrics.
 #
 # HOW TO RUN:
-#   pip install streamlit pandas openpyxl matplotlib
+#   pip install streamlit pandas openpyxl matplotlib pdfplumber
 #   streamlit run app.py
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -12,6 +12,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import pdfplumber                          # for reading PDF files
 
 # ── Page Configuration ────────────────────────────────────────────────────────
 # This must be the very first Streamlit command in the script.
@@ -104,6 +105,58 @@ def load_data(file) -> pd.DataFrame:
     else:
         # openpyxl is needed to read .xlsx files
         return pd.read_excel(file, engine="openpyxl")
+
+
+def load_pdf(file) -> list:
+    """
+    Extract every table from a PDF file and return them as a list of dicts.
+
+    Each dict contains:
+        'label' : human-readable name shown in the dropdown
+        'page'  : page number (1-based) where the table was found
+        'df'    : the table as a pandas DataFrame
+
+    pdfplumber scans each page for grid-like structures.
+    If a page has no tables, it is skipped silently.
+    """
+    results = []
+
+    with pdfplumber.open(file) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            page_tables = page.extract_tables()           # list of raw 2-D lists
+
+            for tbl_num, raw in enumerate(page_tables, start=1):
+                # Skip empty or single-row tables (no data rows)
+                if not raw or len(raw) < 2:
+                    continue
+
+                # First row → column headers; clean up None / whitespace
+                headers = [
+                    str(h).strip() if h else f"Column {i}"
+                    for i, h in enumerate(raw[0])
+                ]
+
+                # Remaining rows → data
+                rows = raw[1:]
+
+                try:
+                    df_tbl = pd.DataFrame(rows, columns=headers)
+                    df_tbl = df_tbl.dropna(how="all")    # drop fully empty rows
+
+                    if len(df_tbl) == 0:
+                        continue
+
+                    results.append({
+                        "label": f"Page {page_num}  –  Table {tbl_num}  "
+                                 f"({len(df_tbl)} rows × {len(df_tbl.columns)} cols)",
+                        "page": page_num,
+                        "df":   df_tbl,
+                    })
+                except Exception:
+                    # If pandas can't build a DataFrame from this table, skip it
+                    continue
+
+    return results
 
 
 def validate_columns(df: pd.DataFrame) -> list:
@@ -216,14 +269,14 @@ st.markdown("---")
 # ─────────────────────────────────────────────────────────────────────────────
 
 uploaded_file = st.file_uploader(
-    "📂 Upload your dataset (CSV or Excel .xlsx)",
-    type=["csv", "xlsx"],
-    help="The file must contain all required columns. See the sample below.",
+    "📂 Upload your dataset (CSV, Excel .xlsx, or PDF)",
+    type=["csv", "xlsx", "pdf"],
+    help="CSV/Excel: must contain all required columns. PDF: tables are extracted automatically.",
 )
 
 # If no file is uploaded yet, show guidance and stop here.
 if uploaded_file is None:
-    st.info("👆 Please upload a CSV or Excel file to get started.")
+    st.info("👆 Please upload a CSV, Excel, or PDF file to get started.")
 
     with st.expander("📌 Click here to see the required file format & a sample"):
         st.markdown(
@@ -255,29 +308,160 @@ if uploaded_file is None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOAD & VALIDATE DATA
+# LOAD DATA  –  branch on file type
 # ─────────────────────────────────────────────────────────────────────────────
 
-df = load_data(uploaded_file)
+is_pdf = uploaded_file.name.lower().endswith(".pdf")
 
-# Check for missing columns
-missing_cols = validate_columns(df)
-if missing_cols:
-    st.error(
-        f"❌ Your file is missing these required columns: "
-        f"**{', '.join(missing_cols)}**\n\n"
-        f"Please fix the file and re-upload."
+# ── PDF path ──────────────────────────────────────────────────────────────────
+if is_pdf:
+    st.markdown("### 📄 PDF detected — extracting tables…")
+
+    with st.spinner("Scanning PDF for tables…"):
+        pdf_tables = load_pdf(uploaded_file)
+
+    if not pdf_tables:
+        st.error(
+            "❌ No tables were found in this PDF. "
+            "Make sure the PDF contains grid/table data (not just plain text or images)."
+        )
+        st.stop()
+
+    st.success(f"✅ Found **{len(pdf_tables)} table(s)** in the PDF.")
+
+    # ── Step 1 : pick a table ─────────────────────────────────────────────────
+    st.markdown("#### Step 1 — Select the table that contains company data")
+
+    table_labels = [t["label"] for t in pdf_tables]
+    chosen_label = st.selectbox("Choose a table:", table_labels, key="pdf_table_sel")
+    chosen_table = next(t for t in pdf_tables if t["label"] == chosen_label)
+
+    with st.expander("🔍 Preview selected table (first 10 rows)"):
+        st.dataframe(chosen_table["df"].head(10), use_container_width=True)
+
+    pdf_cols = list(chosen_table["df"].columns)
+
+    # ── Step 2 : map PDF columns → required columns ───────────────────────────
+    st.markdown("#### Step 2 — Map table columns to required fields")
+    st.caption(
+        "For each required field, choose the matching column from your PDF table. "
+        "If the field doesn't exist in the PDF, leave it as **— skip —** "
+        "(skipped numeric fields default to 0)."
     )
-    st.stop()
 
-# Strip any accidental whitespace from the Company Name column
+    SKIP = "— skip —"
+    col_options = [SKIP] + pdf_cols   # allow skipping optional fields
+
+    # Auto-match: if a PDF column name closely matches a required column, pre-select it.
+    def best_match(required: str, candidates: list) -> str:
+        req_lower = required.lower().replace(" ", "").replace("-", "")
+        for c in candidates:
+            if req_lower in c.lower().replace(" ", "").replace("-", ""):
+                return c
+        return SKIP
+
+    mapping = {}      # required_col_name → pdf_col_name (or SKIP)
+
+    # Lay out the mapping selectors in two columns for a tidier look
+    left_fields  = REQUIRED_COLUMNS[:5]
+    right_fields = REQUIRED_COLUMNS[5:]
+
+    map_col_left, map_col_right = st.columns(2)
+
+    for field in left_fields:
+        auto = best_match(field, pdf_cols)
+        default_idx = col_options.index(auto) if auto in col_options else 0
+        with map_col_left:
+            mapping[field] = st.selectbox(
+                f"**{field}**", col_options,
+                index=default_idx,
+                key=f"pdfmap_{field}",
+            )
+
+    for field in right_fields:
+        auto = best_match(field, pdf_cols)
+        default_idx = col_options.index(auto) if auto in col_options else 0
+        with map_col_right:
+            mapping[field] = st.selectbox(
+                f"**{field}**", col_options,
+                index=default_idx,
+                key=f"pdfmap_{field}",
+            )
+
+    # ── Step 3 : build the final DataFrame ────────────────────────────────────
+    st.markdown("#### Step 3 — Build & review the mapped data")
+
+    if st.button("✅ Apply mapping and load data", type="primary"):
+        st.session_state["pdf_mapping_applied"] = True
+        st.session_state["pdf_mapping"]         = mapping
+        st.session_state["pdf_source_df"]       = chosen_table["df"]
+
+    # Only proceed once the user has clicked Apply
+    if not st.session_state.get("pdf_mapping_applied"):
+        st.info("👆 Click **Apply mapping** above to continue.")
+        st.stop()
+
+    # Re-read confirmed mapping and source from session state
+    mapping  = st.session_state["pdf_mapping"]
+    raw_df   = st.session_state["pdf_source_df"]
+
+    # Build a new DataFrame with the required column names
+    rows_out = []
+    for _, row in raw_df.iterrows():
+        new_row = {}
+        for req_col in REQUIRED_COLUMNS:
+            src_col = mapping[req_col]
+            if src_col == SKIP:
+                # Text columns get empty string; numeric get 0
+                new_row[req_col] = "" if req_col in ("Company Name", "Sector") else 0
+            else:
+                new_row[req_col] = row[src_col]
+        rows_out.append(new_row)
+
+    df = pd.DataFrame(rows_out, columns=REQUIRED_COLUMNS)
+
+    # Convert numeric columns from strings to numbers (PDFs often return strings)
+    numeric_cols = [c for c in REQUIRED_COLUMNS if c not in ("Company Name", "Sector")]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # Drop rows where Company Name is blank / NaN
+    df = df[df["Company Name"].astype(str).str.strip() != ""]
+    df = df[df["Company Name"].astype(str).str.strip() != "nan"]
+
+    if df.empty:
+        st.error(
+            "❌ No valid company rows found after mapping. "
+            "Please check your column mapping and try again."
+        )
+        if st.button("🔄 Reset and re-map"):
+            st.session_state["pdf_mapping_applied"] = False
+        st.stop()
+
+    with st.expander("🔍 Preview mapped data"):
+        st.dataframe(df, use_container_width=True)
+
+# ── CSV / Excel path ──────────────────────────────────────────────────────────
+else:
+    df = load_data(uploaded_file)
+
+    # Check for missing columns
+    missing_cols = validate_columns(df)
+    if missing_cols:
+        st.error(
+            f"❌ Your file is missing these required columns: "
+            f"**{', '.join(missing_cols)}**\n\n"
+            f"Please fix the file and re-upload."
+        )
+        st.stop()
+
+    with st.expander("🔍 Preview uploaded data"):
+        st.dataframe(df, use_container_width=True)
+
+# ── Common: strip whitespace from Company Name ────────────────────────────────
 df["Company Name"] = df["Company Name"].astype(str).str.strip()
 
-st.success(f"✅ File loaded! **{len(df)} companies** found in your dataset.")
-
-# Show the raw data in a collapsible section (handy for debugging)
-with st.expander("🔍 Preview uploaded data"):
-    st.dataframe(df, use_container_width=True)
+st.success(f"✅ Data ready — **{len(df)} companies** loaded.")
 
 st.markdown("---")
 
